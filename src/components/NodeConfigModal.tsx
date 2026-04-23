@@ -63,6 +63,14 @@ const NODE_META: Record<PaletteNodeType, {
       { key: 'description', label: 'Description',    type: 'textarea', placeholder: 'Describe routing logic...' },
     ],
   },
+  'local-llm': {
+    Icon: Brain, label: 'Local LLM', color: 'purple',
+    fields: [
+      { key: 'model',        label: 'Model',         type: 'text',     placeholder: 'deepseek-r1:1.5b' },
+      { key: 'systemPrompt', label: 'System Prompt',  type: 'textarea', placeholder: 'You are a helpful assistant...' },
+      { key: 'description',  label: 'Description',    type: 'text',     placeholder: 'Describe LLM task...' },
+    ],
+  },
 };
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
