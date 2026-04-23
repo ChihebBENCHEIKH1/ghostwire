@@ -19,6 +19,7 @@ const NODE_CONF: Record<PaletteNodeType, {
   postgres:   { Icon: Database, color: '#3b82f6', label: 'Postgres'  },
   redis:      { Icon: Layers,   color: '#f59e0b', label: 'Redis'     },
   filter:     { Icon: Filter,   color: '#10b981', label: 'Filter'    },
+  'local-llm':{ Icon: Brain,    color: '#a855f7', label: 'Local LLM' },
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
