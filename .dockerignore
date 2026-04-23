@@ -1,0 +1,49 @@
+# Dependencies
+node_modules
+npm-debug.log*
+
+# Next.js build output
+.next
+out
+
+# SQLite runtime data (mounted as volume)
+*.db
+*.db-shm
+*.db-wal
+
+# Generated infra stack
+.ghostwire-stack/
+
+# Source control
+.git
+.gitignore
+
+# IDE / OS
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment files (injected at runtime or via secrets)
+.env
+.env.*
+!.env.example
+
+# Test / dev artifacts
+coverage/
+*.test.*
+*.spec.*
+jest.config.*
+
+# CI / infra source (not needed in image)
+.github/
+terraform/
+
+# Docs
+README.md
+CLAUDE.md
+
+# TypeScript build cache
+tsconfig.tsbuildinfo

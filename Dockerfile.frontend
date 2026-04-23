@@ -1,0 +1,61 @@
+# ── Ghostwire Frontend (Next.js) ──────────────────────────────────────────────
+# Multi-stage: deps → builder → production runner
+# Uses Next.js standalone output for minimal image size
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Stage 1 — Install deps
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Stage 2 — Build Next.js
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Standalone output bundles everything needed to run without node_modules
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+
+# Build args injected at build time (Docker build --build-arg)
+ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:3001
+ARG NEXT_PUBLIC_API_KEY=sk-dev-1234
+ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
+ENV NEXT_PUBLIC_API_KEY=$NEXT_PUBLIC_API_KEY
+
+RUN npm run build
+
+# Stage 3 — Minimal production runner
+FROM node:20-alpine AS runner
+RUN apk add --no-cache dumb-init
+
+RUN addgroup --system --gid 1001 nodejs \
+ && adduser  --system --uid  1001 nextjs
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+
+COPY --from=builder /app/public ./public
+
+# Standalone output (set output: 'standalone' in next.config.ts)
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "server.js"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:3000/api/health 2>/dev/null | grep -q ok || \
+      wget -qO- http://localhost:3000 > /dev/null || exit 1

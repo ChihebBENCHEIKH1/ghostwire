@@ -1,0 +1,253 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ghostwire CD — Build → ECR → ECS Deploy (Blue/Green capable)
+#  Triggers: push to main (production) | push to develop (staging)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: CD
+
+on:
+  push:
+    branches:
+      - main      # → production
+      - develop   # → staging
+
+  # Manual trigger with environment override
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+      force_deploy:
+        description: Force deploy even if CI checks failed
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+
+  # ── Resolve environment ─────────────────────────────────────────────────────
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      image_tag:   ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - id: tag
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # ── Build & Push to ECR ─────────────────────────────────────────────────────
+  build-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: setup
+    environment: ${{ needs.setup.outputs.environment }}
+    permissions:
+      id-token: write   # OIDC auth to AWS (no long-lived keys)
+      contents: read
+    outputs:
+      backend_image:  ${{ steps.push-backend.outputs.image }}
+      frontend_image: ${{ steps.push-frontend.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URIs
+        id: uris
+        run: |
+          echo "backend=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_BACKEND_REPO }}:${{ needs.setup.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "frontend=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_FRONTEND_REPO }}:${{ needs.setup.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "backend_latest=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_BACKEND_REPO }}:latest" >> $GITHUB_OUTPUT
+          echo "frontend_latest=${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_FRONTEND_REPO }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push backend
+        id: push-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.uris.outputs.backend }}
+            ${{ steps.uris.outputs.backend_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true  # generate Software Bill of Materials
+
+      - name: Build & Push frontend
+        id: push-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: true
+          build-args: |
+            NEXT_PUBLIC_BACKEND_URL=${{ secrets.NEXT_PUBLIC_BACKEND_URL }}
+            NEXT_PUBLIC_API_KEY=${{ secrets.NEXT_PUBLIC_API_KEY }}
+          tags: |
+            ${{ steps.uris.outputs.frontend }}
+            ${{ steps.uris.outputs.frontend_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # Output the full image URI for later steps
+      - run: |
+          echo "backend=${{ steps.uris.outputs.backend }}" >> $GITHUB_OUTPUT
+          echo "frontend=${{ steps.uris.outputs.frontend }}" >> $GITHUB_OUTPUT
+        id: final-images
+
+  # ── Update ECS Task Definitions ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [setup, build-push]
+    environment: ${{ needs.setup.outputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Backend ──────────────────────────────────────────────────────────────
+
+      - name: Download current backend task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_BACKEND_TASK_FAMILY }} \
+            --query taskDefinition \
+            > backend-task-def.json
+
+      - name: Render new backend task definition
+        id: backend-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: backend-task-def.json
+          container-name: backend
+          image: ${{ needs.build-push.outputs.backend_image }}
+
+      - name: Deploy backend to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.backend-task-def.outputs.task-definition }}
+          service:         ${{ secrets.ECS_BACKEND_SERVICE }}
+          cluster:         ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      # ── Frontend ─────────────────────────────────────────────────────────────
+
+      - name: Download current frontend task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_FRONTEND_TASK_FAMILY }} \
+            --query taskDefinition \
+            > frontend-task-def.json
+
+      - name: Render new frontend task definition
+        id: frontend-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: frontend-task-def.json
+          container-name: frontend
+          image: ${{ needs.build-push.outputs.frontend_image }}
+
+      - name: Deploy frontend to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.frontend-task-def.outputs.task-definition }}
+          service:         ${{ secrets.ECS_FRONTEND_SERVICE }}
+          cluster:         ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      # ── Post-Deploy Smoke Test ────────────────────────────────────────────────
+
+      - name: Smoke test — health endpoint
+        run: |
+          sleep 10
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            "https://${{ secrets.APP_DOMAIN }}/health" || echo "000")
+          if [[ "$STATUS" != "200" ]]; then
+            echo "::error::Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+          echo "Health check passed (HTTP $STATUS)"
+
+      # ── Deployment notification ───────────────────────────────────────────────
+
+      - name: Notify deployment success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ *Ghostwire* deployed to *${{ needs.setup.outputs.environment }}*",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "✅ *Ghostwire* deployed to *${{ needs.setup.outputs.environment }}*\n• Commit: `${{ github.sha }}`\n• Author: ${{ github.actor }}\n• <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify deployment failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "❌ *Ghostwire* deployment FAILED on *${{ needs.setup.outputs.environment }}*",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "❌ *Ghostwire* deployment FAILED on *${{ needs.setup.outputs.environment }}*\n• Commit: `${{ github.sha }}`\n• Author: ${{ github.actor }}\n• <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

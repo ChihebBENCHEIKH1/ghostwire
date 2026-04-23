@@ -1,0 +1,238 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ghostwire Security Workflow
+#  SAST (Semgrep full scan) · DAST (OWASP ZAP) · Secret scan · License audit
+#  Runs: weekly + on every PR to main + manual dispatch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Security
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"   # every Monday 02:00 UTC
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dast_target:
+        description: "DAST target URL (default: staging)"
+        required: false
+        type: string
+
+permissions:
+  security-events: write
+  contents: read
+  pull-requests: write   # post security summary comments on PRs
+
+jobs:
+
+  # ── Secret Detection ─────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for secret scanning
+
+      - name: Gitleaks — scan full git history
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # optional for org use
+
+      - name: TruffleHog — verify secrets are real
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # ── Full Semgrep SAST ─────────────────────────────────────────────────────────
+  semgrep-full:
+    name: Semgrep (Full Ruleset)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep scan
+        run: |
+          semgrep \
+            --config=p/nodejs \
+            --config=p/typescript \
+            --config=p/jwt \
+            --config=p/secrets \
+            --config=p/sql-injection \
+            --config=p/xss \
+            --config=p/owasp-top-ten \
+            --config=p/express \
+            --config=p/react \
+            --sarif \
+            --output=semgrep-full.sarif \
+            --metrics=off \
+            --error
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-full.sarif
+          category: semgrep-full
+
+  # ── npm Audit + License Check ─────────────────────────────────────────────────
+  dependency-security:
+    name: Dependency Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: npm audit
+        run: npm audit --audit-level=moderate --json > npm-audit.json || true
+
+      - name: Parse and annotate npm audit results
+        run: |
+          CRITICAL=$(cat npm-audit.json | jq '.metadata.vulnerabilities.critical // 0')
+          HIGH=$(cat npm-audit.json | jq '.metadata.vulnerabilities.high // 0')
+          MODERATE=$(cat npm-audit.json | jq '.metadata.vulnerabilities.moderate // 0')
+          echo "## npm Audit Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| Moderate | $MODERATE |" >> $GITHUB_STEP_SUMMARY
+          if [[ "$CRITICAL" -gt "0" || "$HIGH" -gt "0" ]]; then
+            echo "::error::Found $CRITICAL critical and $HIGH high severity vulnerabilities"
+            exit 1
+          fi
+
+      - name: License compliance check (license-checker)
+        run: |
+          npx license-checker \
+            --production \
+            --excludePackages "visual-api-builder" \
+            --failOn "GPL;LGPL;AGPL;SSPL" \
+            --json > licenses.json
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: licenses.json
+
+  # ── Infrastructure Security (tfsec + checkov) ────────────────────────────────
+  infra-security:
+    name: IaC Security (tfsec + checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform
+          format: sarif
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkov (IaC + Docker + GitHub Actions)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform,dockerfile,github_actions
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: false
+          skip_check: CKV_GHA_7  # skip: pin action digest (we use tags intentionally)
+
+      - name: Upload Checkov SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  # ── DAST — OWASP ZAP ─────────────────────────────────────────────────────────
+  dast-zap:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    # Only run DAST when we have a live staging environment to test against
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine DAST target URL
+        id: target
+        run: |
+          if [[ -n "${{ inputs.dast_target }}" ]]; then
+            echo "url=${{ inputs.dast_target }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=${{ secrets.STAGING_URL }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ZAP Baseline Scan (passive — no attack)
+        uses: zaproxy/action-baseline@v0.11.0
+        with:
+          target: ${{ steps.target.outputs.url }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: >-
+            -config globalexcludeurl.url_list.url\(0\).regex=.*\.(js|css|png|jpg|gif|ico|svg|woff|ttf).*
+            -config globalexcludeurl.url_list.url\(0\).enabled=true
+          fail_action: true
+          allow_issue_writing: true
+          issue_title: "ZAP Baseline Scan Results"
+
+      - name: ZAP Full Scan (active attack — staging only)
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: ${{ steps.target.outputs.url }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: >-
+            -config replacer.full_list\(0\).description=auth
+            -config replacer.full_list\(0\).enabled=true
+            -config replacer.full_list\(0\).matchtype=REQ_HEADER
+            -config replacer.full_list\(0\).matchstr=x-api-key
+            -config replacer.full_list\(0\).replacement=${{ secrets.ZAP_API_KEY }}
+          fail_action: false   # report but don't block on full scan
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+
+  # ── Security Summary Comment on PR ────────────────────────────────────────────
+  security-summary:
+    name: Post Security Summary
+    runs-on: ubuntu-latest
+    needs: [secret-scan, semgrep-full, dependency-security, infra-security]
+    if: github.event_name == 'pull_request' && always()
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = ${{ toJSON(needs) }};
+            const results = Object.entries(jobs).map(([name, job]) => {
+              const status = job.result === 'success' ? '✅' : job.result === 'skipped' ? '⏭️' : '❌';
+              return `| ${status} | ${name} | ${job.result} |`;
+            }).join('\n');
+
+            const body = `## 🔒 Security Scan Results\n\n| Status | Check | Result |\n|---|---|---|\n${results}\n\n> Generated by the Security workflow`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

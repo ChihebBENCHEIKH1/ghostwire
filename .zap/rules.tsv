@@ -1,0 +1,26 @@
+# ZAP Scan Rules Configuration
+# Format: RULE_ID	ACTION	PARAMETER	EVIDENCE	COMMENT
+# Actions: IGNORE, WARN, FAIL
+
+# Ignore false-positive alerts common in Next.js/Node.js stacks
+
+# Content-Security-Policy — handled by NGINX upstream, ZAP scans pre-NGINX
+10038	IGNORE	Content-Security-Policy		CSP set in nginx.conf
+
+# X-Content-Type-Options — set by NGINX
+10021	IGNORE	X-Content-Type-Options		Set in nginx.conf
+
+# Storable and Cacheable Content — static assets are intentionally cacheable
+10049	IGNORE			Static asset caching is intentional
+
+# Timestamp Disclosure — not sensitive in this context
+10096	IGNORE			Build timestamps are not sensitive
+
+# Server leaks version — mitigated in nginx (server_tokens off)
+10036	IGNORE	Server		server_tokens off in nginx.conf
+
+# Application Error Disclosure — handled by error middleware
+90022	WARN			Monitor but don't fail
+
+# User-controllable HTML element (not XSS risk in API-first app)
+10052	WARN			API-first app, not rendering user HTML directly

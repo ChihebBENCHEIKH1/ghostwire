@@ -1,0 +1,6 @@
+{"receivedAt":"2026-03-11T14:13:55.986Z","payload":{"event":"user.signup","email":"test@example.com"}}
+{"receivedAt":"2026-03-11T14:47:42.046Z","payload":{"event":"user.signup","email":"test@example.com"}}
+{"receivedAt":"2026-03-11T14:48:17.894Z","payload":{"event":"user.signup","email":"test@example.com"}}
+{"receivedAt":"2026-03-11T16:40:09.729Z","payload":{"event":"user.signup","email":"test@example.com"}}
+{"receivedAt":"2026-03-11T16:40:16.387Z","payload":{"event":"test.trigger","userId":"usr_n3w37","email":"test_1773247216376@example.com","source":"quick-fire-button"}}
+{"receivedAt":"2026-03-11T16:40:20.772Z","payload":{"event":"test.trigger","userId":"usr_feg69","email":"test_1773247220766@example.com","source":"quick-fire-button"}}

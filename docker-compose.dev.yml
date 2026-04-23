@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ghostwire — Development Override
+#  Run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#  Or alias: npm run docker:dev
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: ghostwire
+
+services:
+
+  # In dev: skip the built frontend image — run `npm run dev` on your host
+  frontend:
+    build:
+      target: deps  # stop at the deps stage — no build needed in dev
+    command: ["npm", "run", "dev"]
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+
+  backend:
+    build:
+      target: runner
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - pipeline_data:/data
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    command: ["node", "--watch", "server.js"]
+
+  postgres:
+    ports:
+      - "5432:5432"  # expose postgres to host for local DB tools (TablePlus etc.)
+
+  redis:
+    ports:
+      - "6379:6379"  # expose redis to host for redis-cli
+
+  nginx:
+    # Skip nginx in dev — connect directly to services
+    profiles: ["production"]
+
+  ollama:
+    ports:
+      - "11434:11434"  # expose ollama to host for direct testing

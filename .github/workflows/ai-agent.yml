@@ -1,0 +1,548 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Ghostwire AI Agent Workflow
+#
+#  Three agentic loops powered by Claude:
+#
+#  1. ai-code-review   — Deep code review on every PR (not just lint errors)
+#  2. ai-security-triage — When security scans find issues, Claude triages
+#                          severity, writes remediation steps, files GitHub issues
+#  3. ai-deploy-watchdog — Monitors post-deploy health; if health degrades,
+#                          Claude reads recent commits, hypothesizes root cause,
+#                          and opens an issue with a rollback recommendation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: AI Agent
+
+on:
+  # Code review on PRs
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main, develop]
+
+  # Security triage — triggered by completed Security workflow
+  workflow_run:
+    workflows: ["Security"]
+    types: [completed]
+
+  # Deploy watchdog — triggered by completed CD workflow
+  workflow_run:
+    workflows: ["CD"]
+    types: [completed]
+
+  # Manual — run any agent on demand
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: Which agent to run
+        required: true
+        type: choice
+        options:
+          - code-review
+          - security-triage
+          - deploy-watchdog
+      pr_number:
+        description: PR number (for code-review)
+        required: false
+        type: string
+      issue_context:
+        description: Additional context for the agent
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  security-events: read
+
+env:
+  CLAUDE_MODEL: claude-opus-4-6
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  AGENT 1: AI Code Reviewer
+  #  Reads the full PR diff + changed files, posts a structured review comment
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ai-code-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.agent == 'code-review')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          # Fetch the diff between base and head
+          git fetch origin ${{ github.base_ref }} ${{ github.head_ref }} 2>/dev/null || true
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- \
+            '*.ts' '*.tsx' '*.js' '*.json' \
+            ':!*.lock' ':!node_modules' ':!.next' \
+            | head -c 30000)  # cap at 30k chars to stay within context
+          echo "diff<<EODIFF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EODIFF" >> $GITHUB_OUTPUT
+
+      - name: Get changed file list
+        id: files
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep -E '\.(ts|tsx|js|mjs)$' \
+            | grep -v node_modules \
+            | head -20 \
+            | tr '\n' ', ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Run AI Code Review Agent
+        id: review
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          script: |
+            const https = require('https');
+
+            const diff     = process.env.DIFF || '${{ steps.diff.outputs.diff }}';
+            const files    = '${{ steps.files.outputs.files }}';
+            const prTitle  = '${{ github.event.pull_request.title }}';
+            const prBody   = `${{ github.event.pull_request.body }}` || '(no description)';
+
+            const systemPrompt = `You are a Principal Engineer performing a rigorous code review.
+            You are reviewing a pull request for "Ghostwire" — a full-stack DevOps platform
+            (Node.js backend, Next.js 19 frontend, React Flow canvas, Socket.io, SQLite, Docker provisioning).
+
+            Focus on:
+            1. Security vulnerabilities (JWT handling, SQL injection, XSS, CSRF, secrets in code)
+            2. Performance regressions (N+1 queries, unnecessary re-renders, memory leaks)
+            3. Correctness bugs (race conditions, unhandled promises, type coercions)
+            4. Architecture concerns (coupling, missing error handling at system boundaries)
+            5. Positive highlights — what was done particularly well
+
+            Be specific: cite exact file names and line numbers from the diff.
+            Format your response as GitHub-flavoured Markdown.
+            End with a verdict: APPROVE / REQUEST_CHANGES / COMMENT`;
+
+            const userMessage = `
+            ## PR: ${prTitle}
+            **Description:** ${prBody}
+            **Changed files:** ${files}
+
+            ## Diff (truncated to 30k chars):
+            \`\`\`diff
+            ${diff}
+            \`\`\`
+
+            Please review this PR.`;
+
+            const requestBody = JSON.stringify({
+              model: process.env.CLAUDE_MODEL || 'claude-opus-4-6',
+              max_tokens: 4096,
+              messages: [{ role: 'user', content: userMessage }],
+              system: systemPrompt,
+            });
+
+            const response = await new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: 'api.anthropic.com',
+                path: '/v1/messages',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': process.env.ANTHROPIC_API_KEY,
+                  'anthropic-version': '2023-06-01',
+                },
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(JSON.parse(data)));
+              });
+              req.on('error', reject);
+              req.write(requestBody);
+              req.end();
+            });
+
+            const review = response.content?.[0]?.text || 'AI review unavailable';
+            core.setOutput('review', review);
+            return review;
+
+      - name: Post review comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const review = `${{ steps.review.outputs.review }}`;
+            const prNumber = context.payload.pull_request?.number ||
+                             parseInt('${{ inputs.pr_number }}') ||
+                             context.issue.number;
+
+            const body = [
+              '## 🤖 Ghostwire AI Code Review',
+              '',
+              '> *Powered by Claude Opus — automated review, not a substitute for human review*',
+              '',
+              review,
+              '',
+              '---',
+              `*Commit: \`${{ github.sha }}\` · [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  AGENT 2: Security Triage Agent
+  #  Reads SARIF results from the Security workflow → Claude triages each
+  #  finding → auto-files labelled GitHub issues with remediation steps
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ai-security-triage:
+    name: AI Security Triage
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow.name == 'Security' &&
+       github.event.workflow_run.conclusion == 'failure') ||
+      (github.event_name == 'workflow_dispatch' && inputs.agent == 'security-triage')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download security artifacts from triggering run
+        if: github.event_name == 'workflow_run'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              run_id: '${{ github.event.workflow_run.id }}',
+            });
+
+            // Download npm-audit and license reports
+            for (const artifact of artifacts.data.artifacts) {
+              if (['license-report', 'zap-report'].includes(artifact.name)) {
+                const download = await github.rest.actions.downloadArtifact({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  artifact_id: artifact.id,
+                  archive_format: 'zip',
+                });
+                require('fs').writeFileSync(`${artifact.name}.zip`, Buffer.from(download.data));
+              }
+            }
+
+      - name: Fetch GitHub Security Alerts (Code Scanning)
+        id: alerts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const alerts = await github.rest.codeScanning.listAlertsForRepo({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                state: 'open',
+                per_page: 20,
+              });
+              core.setOutput('alerts', JSON.stringify(alerts.data.slice(0, 10)));
+              return alerts.data;
+            } catch(e) {
+              core.warning('Code scanning not enabled or no alerts: ' + e.message);
+              core.setOutput('alerts', '[]');
+            }
+
+      - name: Run AI Security Triage Agent
+        id: triage
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          script: |
+            const https   = require('https');
+            const alerts  = JSON.parse('${{ steps.alerts.outputs.alerts }}' || '[]');
+            const context_hint = '${{ inputs.issue_context }}' || '';
+
+            if (alerts.length === 0) {
+              core.info('No open code scanning alerts — nothing to triage.');
+              core.setOutput('issues', '[]');
+              return [];
+            }
+
+            const alertSummary = alerts.map(a =>
+              `- [${a.rule?.severity?.toUpperCase() || 'UNKNOWN'}] ${a.rule?.name}: ${a.most_recent_instance?.message?.text || ''} in ${a.most_recent_instance?.location?.path}:${a.most_recent_instance?.location?.start_line || '?'}`
+            ).join('\n');
+
+            const systemPrompt = `You are a Security Engineer triaging vulnerabilities in Ghostwire,
+            a Node.js/TypeScript DevOps platform using Express, Socket.io, JWT auth, SQLite, and Docker.
+
+            For each finding:
+            1. Assess real-world exploitability in this specific codebase context
+            2. Estimate CVSS score (1-10) with brief reasoning
+            3. Write concrete remediation steps (code snippets where helpful)
+            4. Classify as: CRITICAL (fix immediately) / HIGH (fix this sprint) / FALSE_POSITIVE (close)
+
+            Output a JSON array of objects:
+            [{ "title": string, "severity": string, "cvss": number, "exploitable": boolean,
+               "remediation": string, "verdict": string }]`;
+
+            const requestBody = JSON.stringify({
+              model: process.env.CLAUDE_MODEL || 'claude-opus-4-6',
+              max_tokens: 4096,
+              messages: [{
+                role: 'user',
+                content: `Security alerts to triage:\n${alertSummary}\n\nAdditional context: ${context_hint || 'none'}`
+              }],
+              system: systemPrompt,
+            });
+
+            const response = await new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: 'api.anthropic.com',
+                path: '/v1/messages',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': process.env.ANTHROPIC_API_KEY,
+                  'anthropic-version': '2023-06-01',
+                },
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(JSON.parse(data)));
+              });
+              req.on('error', reject);
+              req.write(requestBody);
+              req.end();
+            });
+
+            const rawText = response.content?.[0]?.text || '[]';
+            const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+            const issues = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+            core.setOutput('issues', JSON.stringify(issues));
+            return issues;
+
+      - name: File GitHub issues for critical/high findings
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = JSON.parse('${{ steps.triage.outputs.issues }}' || '[]');
+
+            for (const finding of issues) {
+              if (finding.verdict === 'FALSE_POSITIVE') continue;
+
+              const severityEmoji = {
+                CRITICAL: '🔴', HIGH: '🟠', MEDIUM: '🟡', LOW: '🟢'
+              }[finding.severity] || '⚪';
+
+              const issueBody = [
+                `## ${severityEmoji} ${finding.title}`,
+                '',
+                `**Severity:** ${finding.severity} | **CVSS:** ${finding.cvss}/10 | **Exploitable:** ${finding.exploitable ? 'Yes' : 'No'}`,
+                '',
+                '### Remediation',
+                finding.remediation,
+                '',
+                '---',
+                `*Auto-triaged by Ghostwire AI Security Agent · Run: ${{ github.run_id }}*`,
+              ].join('\n');
+
+              const label = finding.severity === 'CRITICAL' ? 'security:critical'
+                          : finding.severity === 'HIGH'     ? 'security:high'
+                                                            : 'security';
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title: `[Security] ${finding.title}`,
+                body:  issueBody,
+                labels: [label, 'ai-triaged'],
+              }).catch(e => core.warning('Could not create issue: ' + e.message));
+            }
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  AGENT 3: Deploy Watchdog
+  #  Runs after every CD deployment — polls health endpoint for 5 min,
+  #  if degraded Claude reads recent commits and writes a diagnosis issue
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  ai-deploy-watchdog:
+    name: AI Deploy Watchdog
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow.name == 'CD' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.agent == 'deploy-watchdog')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 20   # last 20 commits for context
+
+      - name: Poll health endpoint (5 min watch window)
+        id: health
+        run: |
+          TARGET="${{ secrets.STAGING_URL }}/health"
+          echo "Watching $TARGET for 5 minutes post-deploy..."
+
+          DEGRADED=false
+          for i in $(seq 1 10); do
+            sleep 30
+            STATUS=$(curl -sf -o /tmp/health.json -w "%{http_code}" "$TARGET" || echo "000")
+            echo "[$i/10] HTTP $STATUS"
+            if [[ "$STATUS" != "200" ]]; then
+              echo "degraded=true" >> $GITHUB_OUTPUT
+              echo "status=$STATUS" >> $GITHUB_OUTPUT
+              DEGRADED=true
+              break
+            fi
+            # Also check for elevated error rate in response
+            ERROR_RATE=$(cat /tmp/health.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('errorRate',0))" 2>/dev/null || echo "0")
+            if python3 -c "exit(0 if float('$ERROR_RATE') < 0.20 else 1)" 2>/dev/null; then
+              echo "Error rate $ERROR_RATE — still healthy"
+            else
+              echo "degraded=true" >> $GITHUB_OUTPUT
+              echo "status=high-error-rate-$ERROR_RATE" >> $GITHUB_OUTPUT
+              DEGRADED=true
+              break
+            fi
+          done
+
+          if [[ "$DEGRADED" != "true" ]]; then
+            echo "degraded=false" >> $GITHUB_OUTPUT
+            echo "Deployment healthy after 5 minute watch window ✓"
+          fi
+
+      - name: Collect recent commits for AI context
+        if: steps.health.outputs.degraded == 'true'
+        id: commits
+        run: |
+          COMMITS=$(git log --oneline -20 --no-merges | head -c 3000)
+          echo "commits<<EOCOMMITS" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOCOMMITS" >> $GITHUB_OUTPUT
+
+      - name: Run AI Deploy Watchdog Agent
+        if: steps.health.outputs.degraded == 'true'
+        id: diagnosis
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          script: |
+            const https = require('https');
+
+            const systemPrompt = `You are a Site Reliability Engineer for Ghostwire.
+            A production deployment has caused health degradation.
+
+            Ghostwire is a Node.js + Next.js platform with: Express REST API, Socket.io,
+            SQLite (better-sqlite3), Docker provisioner (child_process.spawn), JWT auth,
+            and an Ollama integration. Common failure modes:
+            - SQLite lock contention on deploy (new schema vs old connections)
+            - Socket.io WebSocket upgrade failures after nginx config change
+            - Memory pressure from Ollama model loading
+            - Docker socket permission issues on new container image
+            - Next.js standalone output path misconfiguration
+
+            Analyze the recent commits and health status. Output:
+            1. Most likely root cause (2-3 sentences)
+            2. Immediate mitigation steps (numbered list)
+            3. Rollback command: yes/no + reason
+            Format as Markdown.`;
+
+            const requestBody = JSON.stringify({
+              model: process.env.CLAUDE_MODEL || 'claude-opus-4-6',
+              max_tokens: 2048,
+              messages: [{
+                role: 'user',
+                content: [
+                  `Health check status: ${{ steps.health.outputs.status }}`,
+                  `Deployment SHA: ${{ github.sha }}`,
+                  `Recent commits:\n${{ steps.commits.outputs.commits }}`,
+                  `Additional context: ${{ inputs.issue_context || 'none' }}`,
+                ].join('\n\n'),
+              }],
+              system: systemPrompt,
+            });
+
+            const response = await new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: 'api.anthropic.com',
+                path: '/v1/messages',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-api-key': process.env.ANTHROPIC_API_KEY,
+                  'anthropic-version': '2023-06-01',
+                },
+              }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => resolve(JSON.parse(data)));
+              });
+              req.on('error', reject);
+              req.write(requestBody);
+              req.end();
+            });
+
+            const diagnosis = response.content?.[0]?.text || 'AI diagnosis unavailable';
+            core.setOutput('diagnosis', diagnosis);
+            return diagnosis;
+
+      - name: Open degradation incident issue
+        if: steps.health.outputs.degraded == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const diagnosis = `${{ steps.diagnosis.outputs.diagnosis }}`;
+
+            const body = [
+              '## 🚨 Post-Deploy Health Degradation Detected',
+              '',
+              `**Deployment:** \`${{ github.sha }}\``,
+              `**Health Status:** \`${{ steps.health.outputs.status }}\``,
+              `**Detected at:** ${new Date().toISOString()}`,
+              '',
+              '## AI Root Cause Analysis',
+              '',
+              diagnosis,
+              '',
+              '## Quick Actions',
+              '',
+              '```bash',
+              '# Check ECS service events',
+              'aws ecs describe-services --cluster ghostwire-production-cluster \\',
+              '  --services ghostwire-production-backend',
+              '',
+              '# Roll back to previous task definition',
+              'aws ecs update-service --cluster ghostwire-production-cluster \\',
+              '  --service ghostwire-production-backend \\',
+              '  --task-definition ghostwire-production-backend:PREVIOUS_REVISION',
+              '',
+              '# Check CloudWatch logs',
+              'aws logs tail /ecs/ghostwire-production/backend --follow',
+              '```',
+              '',
+              '---',
+              `*Auto-detected by Ghostwire Deploy Watchdog · [View CD Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`,
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `🚨 Post-Deploy Degradation — ${{ github.sha }}`,
+              body,
+              labels: ['incident', 'ai-triaged', 'priority:p0'],
+            });
+
+            // Also try to trigger rollback notification via Slack
+            core.warning('Deployment degradation detected — issue filed, check Slack for rollback guidance');
